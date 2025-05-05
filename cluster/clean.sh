@@ -39,6 +39,7 @@ function clean() {
     $kubectl delete --ignore-not-found -f $MANIFESTS_DIR/service_account.yaml
     $kubectl delete --ignore-not-found -f $MANIFESTS_DIR/role.yaml
     $kubectl delete --ignore-not-found -f $MANIFESTS_DIR/role_binding.yaml
+    $kubectl delete --ignore-not-found -f $MANIFESTS_DIR/network_policy.yaml
 }
 
 # Use labels so we don't care about prefixes
