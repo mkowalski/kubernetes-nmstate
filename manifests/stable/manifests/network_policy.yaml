@@ -1,0 +1,52 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-chocobomb
+  namespace: openshift-nmstate
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-operator-to-dns-chocobomb
+  namespace: openshift-nmstate
+spec:
+  podSelector:
+    matchLabels:
+      app: kubernetes-nmstate-operator
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+          podSelector:
+            matchLabels:
+              dns.operator.openshift.io/daemonset-dns: default
+      ports:
+        - protocol: TCP
+          port: dns-tcp
+        - protocol: UDP
+          port: dns
+  policyTypes:
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-operator-egress-to-api-server-chocobomb
+  namespace: openshift-nmstate
+spec:
+  podSelector:
+    matchLabels:
+      app: kubernetes-nmstate-operator
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 6443
+  policyTypes:
+    - Egress
