@@ -99,13 +99,10 @@ func Set(desiredState nmstate.State, timeout time.Duration) (string, error) {
 	var setDoneCh = make(chan struct{})
 	defer close(setDoneCh)
 
-	args := []string{"apply"}
-	if debugMode {
-		args = append(args, "-vv")
-	}
-	args = append(args, "--no-commit", "--timeout", strconv.Itoa(int(timeout.Seconds())))
-
-	setOutput, err := nmstatectlWithInput(args, string(desiredState.Raw))
+	setOutput, err := nmstatectlWithInput(
+		[]string{"apply", "--no-commit", "--timeout", strconv.Itoa(int(timeout.Seconds()))},
+		string(desiredState.Raw),
+	)
 	return setOutput, err
 }
 
