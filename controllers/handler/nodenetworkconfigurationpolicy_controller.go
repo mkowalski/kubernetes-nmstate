@@ -594,28 +594,3 @@ func (r *NodeNetworkConfigurationPolicyReconciler) shouldAbortReconcile(
 	}
 	return false, nil
 }
-
-func allPolicies(client client.Client, log logr.Logger) handler.TypedMapFunc[*corev1.Node, reconcile.Request] {
-	return handler.TypedMapFunc[*corev1.Node, reconcile.Request](
-		func(context.Context, *corev1.Node) []reconcile.Request {
-			logger := log.WithName("allPolicies")
-			allPoliciesAsRequest := []reconcile.Request{}
-			policyList := nmstatev1.NodeNetworkConfigurationPolicyList{}
-			err := client.List(context.TODO(), &policyList)
-			if err != nil {
-				logger.Error(err, "failed listing all NodeNetworkConfigurationPolicies to re-reconcile them after node created or updated")
-				return []reconcile.Request{}
-			}
-			sort.Slice(policyList.Items, func(i, j int) bool {
-				return policyList.Items[i].Name < policyList.Items[j].Name
-			})
-			for policyIndex := range policyList.Items {
-				policy := policyList.Items[policyIndex]
-				allPoliciesAsRequest = append(allPoliciesAsRequest, reconcile.Request{
-					NamespacedName: types.NamespacedName{
-						Name: policy.Name,
-					}})
-			}
-			return allPoliciesAsRequest
-		})
-}
