@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/nmstate/kubernetes-nmstate/pkg/enactment"
+	// "github.com/nmstate/kubernetes-nmstate/pkg/enactment"
 	"github.com/pkg/errors"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
@@ -578,19 +578,22 @@ func (r *NodeNetworkConfigurationPolicyReconciler) shouldAbortReconcile(
 	instance *nmstatev1.NodeNetworkConfigurationPolicy,
 ) (bool, error) {
 	logger := r.Log.WithName("shouldAbortReconcile")
-	_, enactmentCountByCondition, err := enactment.CountByPolicy(r.APIClient, instance)
-	if err != nil {
-		logger.Error(err, "Error getting enactment counts")
-		return false, err
-	}
 	maxUnavailable, err := node.MaxUnavailableNodeCount(r.APIClient, instance)
 	if err != nil {
 		logger.Info("Error getting max unavailable count")
 		return false, err
 	}
-	if !(enactmentCountByCondition.NotProgressing() < maxUnavailable) {
-		logger.Info(fmt.Sprintf("policy %q has reached the maximum unavailable failing enactments, aborting", instance.Name))
-		return true, nil
+
+	filter := enactmentconditions.LogicalConditionCountFilter{
+		nmstateapi.NodeNetworkConfigurationEnactmentConditionFailing:  corev1.ConditionTrue,
+		nmstateapi.NodeNetworkConfigurationPolicyConditionProgressing: corev1.ConditionFalse,
 	}
-	return false, nil
+
+	failedConditionCount, err := enactmentconditions.CountConditionsLogicalAnd(r.APIClient, *instance, filter)
+	if err != nil {
+		logger.Info("Error getting unavailable enactment count")
+		return false, err
+	}
+
+	return failedConditionCount >= maxUnavailable, nil
 }
