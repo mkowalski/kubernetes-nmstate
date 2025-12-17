@@ -59,6 +59,7 @@ type DNSResolverData struct {
 // interfaceFields allows unmarshaling directly into the defined fields
 type interfaceFields struct {
 	Name string `json:"name" yaml:"name"`
+	Type string `json:"type" yaml:"type"`
 }
 
 // routeFields allows unmarshaling directly into the defined fields
@@ -81,6 +82,7 @@ func (i *interfaceState) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("failed Unmarshaling raw: %w", err)
 	}
 	i.Data["name"] = ifaceFields.Name
+	i.Data["type"] = ifaceFields.Type
 	i.interfaceFields = ifaceFields
 	return nil
 }

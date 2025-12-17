@@ -83,6 +83,7 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 
 	metrics.Registry.MustRegister(monitoring.AppliedFeatures)
+	metrics.Registry.MustRegister(monitoring.NetworkInterfaces)
 }
 
 func main() {
@@ -390,6 +391,17 @@ func setupMetricsManager(mgr manager.Manager) error {
 		setupLog.Error(err, "unable to create NodeNetworkConfigurationEnactment metrics controller", "metrics", "NMState")
 		return err
 	}
+
+	setupLog.Info("Creating Metrics NodeNetworkState controller")
+	if err := (&controllersmetrics.NodeNetworkStateReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("metrics").WithName("NodeNetworkState"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create NodeNetworkState metrics controller", "metrics", "NMState")
+		return err
+	}
+
 	return nil
 }
 

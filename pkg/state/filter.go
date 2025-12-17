@@ -38,6 +38,22 @@ func FilterOut(currentState shared.State) (shared.State, error) {
 	return filterOut(currentState)
 }
 
+// CountInterfacesByType parses the state and returns a map of interface type to count.
+func CountInterfacesByType(currentState shared.State) (map[string]int, error) {
+	var state rootState
+	if err := yaml.Unmarshal(currentState.Raw, &state); err != nil {
+		return nil, err
+	}
+
+	counts := make(map[string]int)
+	for _, iface := range state.Interfaces {
+		if iface.Type != "" {
+			counts[iface.Type]++
+		}
+	}
+	return counts, nil
+}
+
 func filterOutRoutes(routes []routeState, filteredInterfaces []interfaceState) []routeState {
 	filteredRoutes := []routeState{}
 	for _, route := range routes {

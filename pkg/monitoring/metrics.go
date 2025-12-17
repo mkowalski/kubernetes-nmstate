@@ -29,12 +29,24 @@ var (
 		Help: "Number of nmstate features applied labeled by its name",
 	}
 
+	NetworkInterfacesOpts = prometheus.GaugeOpts{
+		Name: "kubernetes_nmstate_network_interfaces",
+		Help: "Number of network interfaces labeled by its type",
+	}
+
 	AppliedFeatures = prometheus.NewGaugeVec(
 		AppliedFeaturesOpts,
 		[]string{"name"},
 	)
+
+	NetworkInterfaces = prometheus.NewGaugeVec(
+		NetworkInterfacesOpts,
+		[]string{"name"},
+	)
+
 	gaugeOpts = []prometheus.GaugeOpts{
 		AppliedFeaturesOpts,
+		NetworkInterfacesOpts,
 	}
 )
 
