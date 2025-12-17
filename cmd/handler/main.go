@@ -84,6 +84,7 @@ func init() {
 
 	metrics.Registry.MustRegister(monitoring.AppliedFeatures)
 	metrics.Registry.MustRegister(monitoring.NetworkInterfaces)
+	metrics.Registry.MustRegister(monitoring.NetworkRoutes)
 }
 
 func main() {

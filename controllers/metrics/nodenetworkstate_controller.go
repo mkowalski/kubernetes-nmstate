@@ -19,10 +19,10 @@ package metrics
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,46 +39,60 @@ import (
 // NodeNetworkStateReconciler reconciles a NodeNetworkState object for metrics
 type NodeNetworkStateReconciler struct {
 	client.Client
-	Log     logr.Logger
-	Scheme  *runtime.Scheme
-	oldNNSs map[string]map[string]int // map of NNS name to interface type counts
+	Log    logr.Logger
+	Scheme *runtime.Scheme
+	// Track interface types per node to clean up stale metrics
+	oldInterfaceTypes map[string]map[string]struct{} // node name -> set of interface types
+	// Track route keys per node to clean up stale metrics
+	oldRouteKeys map[string]map[state.RouteKey]struct{} // node name -> set of route keys
 }
 
 // Reconcile reads the state of the cluster for a NodeNetworkState object and calculates
-// metrics for network interface counts by type.
+// metrics for network interface counts by type and node.
 func (r *NodeNetworkStateReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("metrics.nodenetworkstate", request.NamespacedName)
 	log.Info("Reconcile")
+
+	nodeName := request.Name
 
 	nnsInstance := &nmstatev1beta1.NodeNetworkState{}
 	err := r.Client.Get(ctx, request.NamespacedName, nnsInstance)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			// NNS has been deleted, clean up the old NNS map
-			delete(r.oldNNSs, request.Name)
+			// NNS has been deleted, clean up metrics for this node
+			r.deleteNodeMetrics(nodeName)
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Error retrieving NodeNetworkState")
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reportStatistics(ctx); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed reporting statistics: %w", err)
-	}
-
-	// Store current interface counts for future delta calculation
+	// Count interfaces by type for this node
 	counts, err := state.CountInterfacesByType(nnsInstance.Status.CurrentState)
 	if err != nil {
 		log.Error(err, "Failed to count interfaces by type")
-	} else {
-		r.oldNNSs[nnsInstance.Name] = counts
+		return ctrl.Result{}, err
 	}
+
+	// Update interface metrics for this node
+	r.updateNodeInterfaceMetrics(nodeName, counts)
+
+	// Count routes by IP stack and type for this node
+	routeCounts, err := state.CountRoutes(nnsInstance.Status.CurrentState)
+	if err != nil {
+		log.Error(err, "Failed to count routes")
+		return ctrl.Result{}, err
+	}
+
+	// Update route metrics for this node
+	r.updateNodeRouteMetrics(nodeName, routeCounts)
 
 	return ctrl.Result{}, nil
 }
 
 func (r *NodeNetworkStateReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.oldNNSs = map[string]map[string]int{}
+	r.oldInterfaceTypes = make(map[string]map[string]struct{})
+	r.oldRouteKeys = make(map[string]map[state.RouteKey]struct{})
 
 	onCreationOrUpdateForThisNNS := predicate.Funcs{
 		CreateFunc: func(createEvent event.CreateEvent) bool {
@@ -116,55 +130,88 @@ func (r *NodeNetworkStateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return nil
 }
 
-func (r *NodeNetworkStateReconciler) reportStatistics(ctx context.Context) error {
-	nnsList := nmstatev1beta1.NodeNetworkStateList{}
-	if err := r.List(ctx, &nnsList); err != nil {
-		return err
+// updateNodeInterfaceMetrics sets the interface count metrics for a specific node
+func (r *NodeNetworkStateReconciler) updateNodeInterfaceMetrics(nodeName string, counts map[string]int) {
+	// Get the old interface types for this node to detect removed types
+	oldTypes := r.oldInterfaceTypes[nodeName]
+	newTypes := make(map[string]struct{})
+
+	// Set metrics for current interface types
+	for ifaceType, count := range counts {
+		monitoring.NetworkInterfaces.With(prometheus.Labels{
+			"type": ifaceType,
+			"node": nodeName,
+		}).Set(float64(count))
+		newTypes[ifaceType] = struct{}{}
 	}
 
-	// Calculate old and new cluster-wide interface type counts
-	oldCounts := make(map[string]int)
-	newCounts := make(map[string]int)
-
-	for i := range nnsList.Items {
-		nns := &nnsList.Items[i]
-
-		// Get new counts from current state
-		counts, err := state.CountInterfacesByType(nns.Status.CurrentState)
-		if err != nil {
-			r.Log.Error(err, "Failed to count interfaces by type", "nns", nns.Name)
-			continue
-		}
-		for ifaceType, count := range counts {
-			newCounts[ifaceType] += count
-		}
-
-		// Get old counts if available
-		if oldNNSCounts, ok := r.oldNNSs[nns.Name]; ok {
-			for ifaceType, count := range oldNNSCounts {
-				oldCounts[ifaceType] += count
-			}
+	// Delete metrics for interface types that no longer exist on this node
+	for oldType := range oldTypes {
+		if _, exists := newTypes[oldType]; !exists {
+			monitoring.NetworkInterfaces.Delete(prometheus.Labels{
+				"type": oldType,
+				"node": nodeName,
+			})
 		}
 	}
 
-	// Calculate delta and update metrics
-	// First, handle types that exist in new counts
-	for ifaceType, newCount := range newCounts {
-		oldCount := oldCounts[ifaceType]
-		delta := newCount - oldCount
-		if delta > 0 {
-			monitoring.NetworkInterfaces.WithLabelValues(ifaceType).Add(float64(delta))
-		} else if delta < 0 {
-			monitoring.NetworkInterfaces.WithLabelValues(ifaceType).Sub(float64(-delta))
+	// Store current types for next reconcile
+	r.oldInterfaceTypes[nodeName] = newTypes
+}
+
+// updateNodeRouteMetrics sets the route count metrics for a specific node
+func (r *NodeNetworkStateReconciler) updateNodeRouteMetrics(nodeName string, counts map[state.RouteKey]int) {
+	// Get the old route keys for this node to detect removed keys
+	oldKeys := r.oldRouteKeys[nodeName]
+	newKeys := make(map[state.RouteKey]struct{})
+
+	// Set metrics for current route keys
+	for key, count := range counts {
+		monitoring.NetworkRoutes.With(prometheus.Labels{
+			"node":     nodeName,
+			"ip_stack": key.IPStack,
+			"type":     key.Type,
+		}).Set(float64(count))
+		newKeys[key] = struct{}{}
+	}
+
+	// Delete metrics for route keys that no longer exist on this node
+	for oldKey := range oldKeys {
+		if _, exists := newKeys[oldKey]; !exists {
+			monitoring.NetworkRoutes.Delete(prometheus.Labels{
+				"node":     nodeName,
+				"ip_stack": oldKey.IPStack,
+				"type":     oldKey.Type,
+			})
 		}
 	}
 
-	// Handle types that exist in old counts but not in new counts (removed interfaces)
-	for ifaceType, oldCount := range oldCounts {
-		if _, exists := newCounts[ifaceType]; !exists {
-			monitoring.NetworkInterfaces.WithLabelValues(ifaceType).Sub(float64(oldCount))
+	// Store current keys for next reconcile
+	r.oldRouteKeys[nodeName] = newKeys
+}
+
+// deleteNodeMetrics removes all interface and route count metrics for a specific node
+func (r *NodeNetworkStateReconciler) deleteNodeMetrics(nodeName string) {
+	// Delete interface metrics
+	if oldTypes, ok := r.oldInterfaceTypes[nodeName]; ok {
+		for ifaceType := range oldTypes {
+			monitoring.NetworkInterfaces.Delete(prometheus.Labels{
+				"type": ifaceType,
+				"node": nodeName,
+			})
 		}
+		delete(r.oldInterfaceTypes, nodeName)
 	}
 
-	return nil
+	// Delete route metrics
+	if oldKeys, ok := r.oldRouteKeys[nodeName]; ok {
+		for key := range oldKeys {
+			monitoring.NetworkRoutes.Delete(prometheus.Labels{
+				"node":     nodeName,
+				"ip_stack": key.IPStack,
+				"type":     key.Type,
+			})
+		}
+		delete(r.oldRouteKeys, nodeName)
+	}
 }
