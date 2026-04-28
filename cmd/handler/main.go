@@ -74,6 +74,12 @@ import (
 
 const generalExitStatus int = 1
 
+const (
+	defaultRetriesUntilFail = 5
+	defaultMaxBackoff       = 30 * time.Second
+	defaultInitialBackoff   = 1 * time.Second
+)
+
 type ProfilerConfig struct {
 	EnableProfiler bool   `envconfig:"ENABLE_PROFILER"`
 	ProfilerPort   string `envconfig:"PROFILER_PORT" default:"6060"`
@@ -246,10 +252,7 @@ func setupTLSProfileWatcher(mgr manager.Manager, cancel context.CancelFunc) erro
 // metrics endpoint via TokenReview/SubjectAccessReview.
 func createManager(cfg *rest.Config, tlsOpts func(*tls.Config), isOpenShift bool) (manager.Manager, error) {
 	// Get metrics bind address from environment variable, with default fallback
-	metricsBindAddress := os.Getenv("METRICS_BIND_ADDRESS")
-	if metricsBindAddress == "" {
-		metricsBindAddress = ":8089"
-	}
+	metricsBindAddress := environment.GetEnvVar("METRICS_BIND_ADDRESS", ":8089")
 
 	metricsOpts := metricsserver.Options{
 		BindAddress:   metricsBindAddress,
@@ -479,7 +482,10 @@ func setupHandlerControllers(mgr manager.Manager) error {
 		Log:       ctrl.Log.WithName("controllers").WithName("NodeNetworkConfigurationPolicy"),
 		Scheme:    mgr.GetScheme(),
 		//nolint:staticcheck // TODO: migrate to GetEventRecorder
-		Recorder: mgr.GetEventRecorderFor(fmt.Sprintf("%s.nmstate-handler", environment.NodeName())),
+		Recorder:           mgr.GetEventRecorderFor(fmt.Sprintf("%s.nmstate-handler", environment.NodeName())),
+		RetriesUntilFail:   environment.GetEnvVarAsInt("NNCP_MAX_RETRIES", defaultRetriesUntilFail),
+		MaximumTimeBackoff: environment.GetEnvVarAsDuration("NNCP_MAX_BACKOFF_SECONDS", defaultMaxBackoff),
+		InitialBackoff:     environment.GetEnvVarAsDuration("NNCP_INITIAL_BACKOFF_SECONDS", defaultInitialBackoff),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create NodeNetworkConfigurationPolicy controller", "controller", "NMState")
 		return err
@@ -526,7 +532,7 @@ func checkNmstateIsWorking() error {
 
 func retrieveCertAndCAIntervals() (certificate.Options, error) {
 	certManagerOpts := certificate.Options{
-		Namespace:   os.Getenv("POD_NAMESPACE"),
+		Namespace:   environment.GetEnvVar("POD_NAMESPACE", ""),
 		WebhookName: "nmstate",
 		WebhookType: certificate.MutatingWebhook,
 		ExtraLabels: names.IncludeRelationshipLabels(nil),
