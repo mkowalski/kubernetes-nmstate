@@ -16,6 +16,9 @@ spec:
       app: {{ .PluginName }}
   template:
     metadata:
+      annotations:
+        target.workload.openshift.io/management: |
+          {"effect": "PreferredDuringScheduling"}
       labels:
         app: {{ .PluginName }}
     spec:
@@ -28,6 +31,7 @@ spec:
       {{- if .InfraAffinity }}
       affinity: {{ toYaml .InfraAffinity | nindent 8 }}
       {{- end }}
+      serviceAccountName: {{ .PluginName }}
       containers:
         - name: {{ .PluginName }}
           image: {{ .PluginImage }}

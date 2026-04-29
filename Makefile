@@ -7,7 +7,7 @@ export IMAGE_REGISTRY ?= quay.io
 IMAGE_REPO ?= nmstate
 NAMESPACE ?= nmstate
 
-ifeq ($(NMSTATE_PIN), future)
+ifeq ($(NMSTATE_VERSION), latest)
 HANDLER_EXTRA_PARAMS:= "--build-arg NMSTATE_SOURCE=git"
 endif
 
@@ -86,7 +86,8 @@ export KUBECTL ?= ./cluster/kubectl.sh
 KUBECTL ?= ./cluster/kubectl.sh
 OPERATOR_SDK_VERSION ?= 1.37.0
 
-GINKGO = GOFLAGS=-mod=mod go run github.com/onsi/ginkgo/v2/ginkgo@v2.11.0
+GINKGO_VERSION ?= v2.22.1
+GINKGO = GOFLAGS=-mod=mod go run github.com/onsi/ginkgo/v2/ginkgo@$(GINKGO_VERSION)
 CONTROLLER_GEN = GOFLAGS=-mod=mod go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.1
 OPM = hack/opm.sh
 
@@ -121,6 +122,8 @@ all: check handler operator
 check: lint vet whitespace-check gofmt-check promlint-check
 
 format: whitespace-format gofmt
+
+pre-push: check test/unit
 
 vet:
 	GOFLAGS=-mod=mod go vet ./...
@@ -203,6 +206,12 @@ test/unit/api:
 
 test/unit: test/unit/api
 	NODE_NAME=node01 $(GINKGO) --junit-report=junit-pkg-controller-unit-test.xml $(unit_test_args) $(WHAT)
+
+test-reporter:
+	cd automation/nmstate-latest-reporter && \
+		go run . --dry-run --fake=success && \
+		go run . --dry-run --fake=failure && \
+		go run . --dry-run --fake=stale
 
 test-e2e-handler:
 	KUBECONFIG=$(KUBECONFIG) OPERATOR_NAMESPACE=$(OPERATOR_NAMESPACE) MONITORING_NAMESPACE=$(MONITORING_NAMESPACE) $(GINKGO) $(e2e_test_args) ./test/e2e/handler ...
@@ -298,6 +307,7 @@ olm-push: bundle-push index-push
 	all \
 	check \
 	format \
+	pre-push \
 	vet \
 	handler \
 	push-handler \
@@ -308,6 +318,7 @@ olm-push: bundle-push index-push
 	test-e2e-handler \
 	test-e2e-operator \
 	test-e2e \
+	test-reporter\
 	cluster-up \
 	cluster-down \
 	cluster-sync-operator \

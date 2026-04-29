@@ -18,26 +18,32 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	// +kubebuilder:scaffold:imports
@@ -55,15 +61,24 @@ import (
 	nmstatev1beta1 "github.com/nmstate/kubernetes-nmstate/api/v1beta1"
 	controllers "github.com/nmstate/kubernetes-nmstate/controllers/handler"
 	controllersmetrics "github.com/nmstate/kubernetes-nmstate/controllers/metrics"
+	"github.com/nmstate/kubernetes-nmstate/pkg/cluster"
+	"github.com/nmstate/kubernetes-nmstate/pkg/enactmentstatus"
 	"github.com/nmstate/kubernetes-nmstate/pkg/environment"
 	"github.com/nmstate/kubernetes-nmstate/pkg/file"
 	nmstatelog "github.com/nmstate/kubernetes-nmstate/pkg/log"
 	"github.com/nmstate/kubernetes-nmstate/pkg/monitoring"
 	"github.com/nmstate/kubernetes-nmstate/pkg/nmstatectl"
+	nmstatetls "github.com/nmstate/kubernetes-nmstate/pkg/tls"
 	"github.com/nmstate/kubernetes-nmstate/pkg/webhook"
 )
 
 const generalExitStatus int = 1
+
+const (
+	defaultRetriesUntilFail = 5
+	defaultMaxBackoff       = 30 * time.Second
+	defaultInitialBackoff   = 1 * time.Second
+)
 
 type ProfilerConfig struct {
 	EnableProfiler bool   `envconfig:"ENABLE_PROFILER"`
@@ -83,6 +98,10 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 
 	metrics.Registry.MustRegister(monitoring.AppliedFeatures)
+	metrics.Registry.MustRegister(monitoring.NetworkInterfaces)
+	metrics.Registry.MustRegister(monitoring.NetworkRoutes)
+	metrics.Registry.MustRegister(monitoring.PolicyStatus)
+	metrics.Registry.MustRegister(monitoring.EnactmentStatus)
 }
 
 func main() {
@@ -122,17 +141,45 @@ func mainHandler() int {
 		defer handlerLock.Unlock()
 	}
 
-	mgr, err := createManager()
+	cfg := ctrl.GetConfigOrDie()
+
+	// Detect OpenShift and fetch TLS profile early, before creating the
+	// manager, so both the metrics server and webhooks share the same config.
+	platformTLSOpts, err := cluster.FetchOpenShiftTLSOpts(cfg, scheme)
+	if err != nil {
+		setupLog.Error(err, "unable to fetch TLS configuration")
+		return generalExitStatus
+	}
+
+	// Compose the TLS opts applied to all TLS-enabled servers.
+	tlsOpts := composeTLSOpts(platformTLSOpts)
+
+	mgr, err := createManager(cfg, tlsOpts, platformTLSOpts != nil /*isOpenShift*/)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		return generalExitStatus
 	}
 
-	if err := setupControllersByEnvironment(mgr); err != nil {
+	// Create a cancellable context so that controllers (e.g. the TLS
+	// security profile watcher) can trigger a graceful shutdown.
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
+
+	// On OpenShift, watch for TLS profile changes on processes that serve
+	// TLS (webhook and metrics) and trigger a graceful shutdown so they
+	// restart with the new configuration.
+	if platformTLSOpts != nil && (environment.IsWebhook() || environment.IsMetricsManager()) {
+		if err := setupTLSProfileWatcher(mgr, cancel); err != nil {
+			setupLog.Error(err, "unable to set up TLS profile watcher")
+			return generalExitStatus
+		}
+	}
+
+	if err := setupControllersByEnvironment(mgr, tlsOpts); err != nil {
 		return generalExitStatus
 	}
 
-	return startManager(mgr)
+	return startManager(mgr, ctx)
 }
 
 // initializeLogging sets up logging configuration and handles early exit conditions
@@ -161,19 +208,65 @@ func setupHandlerLockIfNeeded() (*flock.Flock, error) {
 	return handlerLock, nil
 }
 
-// createManager creates and configures the controller manager
-func createManager() (manager.Manager, error) {
+// composeTLSOpts returns TLS options for all TLS-enabled servers.
+// Always disables HTTP/2 (CVE-2023-39325), and adds the platform profile opts if present.
+func composeTLSOpts(tlsOpts func(*tls.Config)) func(*tls.Config) {
+	return func(c *tls.Config) {
+		if tlsOpts != nil {
+			tlsOpts(c)
+		}
+		c.NextProtos = []string{"http/1.1"}
+	}
+}
+
+// setupTLSProfileWatcher watches for platform TLS profile changes and
+// triggers a graceful shutdown so the process restarts with the new config.
+func setupTLSProfileWatcher(mgr manager.Manager, cancel context.CancelFunc) error {
+	// Use a non-cached client for the initial fetch because the manager's
+	// cache is not started yet at this point.
+	apiClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+	if err != nil {
+		return fmt.Errorf("failed creating client for TLS profile watcher: %w", err)
+	}
+
+	tlsProfileSpec, err := nmstatetls.FetchAPIServerTLSProfile(context.Background(), apiClient)
+	if err != nil {
+		return fmt.Errorf("unable to get initial TLS profile for watcher: %w", err)
+	}
+
+	return (&nmstatetls.SecurityProfileWatcher{
+		Client:                mgr.GetClient(),
+		InitialTLSProfileSpec: tlsProfileSpec,
+		OnProfileChange: func(ctx context.Context, oldSpec, newSpec nmstatetls.TLSProfileSpec) {
+			setupLog.Info("TLS profile has changed, initiating shutdown to reload",
+				"oldProfile", oldSpec, "newProfile", newSpec)
+			cancel()
+		},
+	}).SetupWithManager(mgr)
+}
+
+// createManager creates and configures the controller manager.
+// The metrics server always uses TLS (SecureServing). On non-OpenShift clusters
+// controller-runtime auto-generates a self-signed certificate.
+// When isOpenShift is true, authentication and authorization are enforced on the
+// metrics endpoint via TokenReview/SubjectAccessReview.
+func createManager(cfg *rest.Config, tlsOpts func(*tls.Config), isOpenShift bool) (manager.Manager, error) {
 	// Get metrics bind address from environment variable, with default fallback
-	metricsBindAddress := os.Getenv("METRICS_BIND_ADDRESS")
-	if metricsBindAddress == "" {
-		metricsBindAddress = ":8089"
+	metricsBindAddress := environment.GetEnvVar("METRICS_BIND_ADDRESS", ":8089")
+
+	metricsOpts := metricsserver.Options{
+		BindAddress:   metricsBindAddress,
+		SecureServing: true,
+		TLSOpts:       []func(*tls.Config){tlsOpts},
+	}
+
+	if isOpenShift {
+		metricsOpts.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
 
 	ctrlOptions := ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: metricsBindAddress,
-		},
+		Scheme:  scheme,
+		Metrics: metricsOpts,
 	}
 
 	if environment.IsHandler() {
@@ -181,16 +274,16 @@ func createManager() (manager.Manager, error) {
 	}
 
 	setupLog.Info("Creating manager")
-	return ctrl.NewManager(ctrl.GetConfigOrDie(), ctrlOptions)
+	return ctrl.NewManager(cfg, ctrlOptions)
 }
 
-// setupControllersByEnvironment configures controllers based on the current environment
-func setupControllersByEnvironment(mgr manager.Manager) error {
+// setupControllersByEnvironment configures controllers based on the current environment.
+func setupControllersByEnvironment(mgr manager.Manager, tlsOpts func(*tls.Config)) error {
 	switch {
 	case environment.IsCertManager():
 		return setupCertManagerEnvironment(mgr)
 	case environment.IsWebhook():
-		return setupWebhookEnvironment(mgr)
+		return setupWebhookEnvironment(mgr, tlsOpts)
 	case environment.IsMetricsManager():
 		return setupMetricsManager(mgr)
 	case environment.IsHandler():
@@ -210,16 +303,25 @@ func setupCertManagerEnvironment(mgr manager.Manager) error {
 }
 
 // setupWebhookEnvironment configures the webhook
-func setupWebhookEnvironment(mgr manager.Manager) error {
-	if err := webhook.AddToManager(mgr); err != nil {
+func setupWebhookEnvironment(mgr manager.Manager, tlsOpts func(*tls.Config)) error {
+	if err := webhook.AddToManager(mgr, tlsOpts); err != nil {
 		setupLog.Error(err, "Cannot initialize webhook")
 		return err
 	}
 	return nil
 }
 
-// setupHandlerEnvironment configures the handler controllers and performs health checks
+// setupHandlerEnvironment cleans up unavailableNodeCounts after unexpected restart,
+// configures the handler controllers and performs health checks
 func setupHandlerEnvironment(mgr manager.Manager) error {
+	// Clean stale unavailable counts from node before starting controllers
+	// Prevents deadlock after unexpected cluster reboot where nodes were
+	// processing NNCP and left stale counts in etcd.
+	if err := cleanStaleUnavailableCounts(mgr); err != nil {
+		setupLog.Error(err, "Failed to cleanup stale unavailable counts, continuing anyway")
+		// Don't error this is best-effort (NNCP needs manual restart)
+	}
+
 	if err := setupHandlerControllers(mgr); err != nil {
 		return err
 	}
@@ -230,14 +332,109 @@ func setupHandlerEnvironment(mgr manager.Manager) error {
 }
 
 // startManager starts the manager and handles profiler setup
-func startManager(mgr manager.Manager) int {
+func startManager(mgr manager.Manager, ctx context.Context) int {
 	setProfiler()
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		return generalExitStatus
 	}
 	return 0
+}
+
+// cleanStaleUnavailableCounts cleans up stale unavailable node counts that have been
+// left in NNCP status after unexpected cluster reboots.
+func cleanStaleUnavailableCounts(mgr manager.Manager) error {
+	ctx := context.Background()
+	nodeName := environment.NodeName()
+	setupLog.Info("Cleaning up stale unavailable counts for node", "node", nodeName)
+
+	apiClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+	if err != nil {
+		return err
+	}
+
+	enactmentList := &nmstatev1beta1.NodeNetworkConfigurationEnactmentList{}
+	nodeLabel := client.MatchingLabels{nmstateapi.EnactmentNodeLabel: nodeName}
+	if err := apiClient.List(ctx, enactmentList, nodeLabel); err != nil {
+		return err
+	}
+
+	// For each enactment that was "Progressing" (interrupted by reboot)
+	for i := range enactmentList.Items {
+		enactment := &enactmentList.Items[i]
+		if enactmentstatus.IsProgressing(&enactment.Status.Conditions) {
+			policyName := enactment.Labels[nmstateapi.EnactmentPolicyLabel]
+			generationKey := strconv.FormatInt(enactment.Status.PolicyGeneration, 10)
+
+			setupLog.Info("detected stale progressing enactment, cleaning up",
+				"enactment", enactment.Name,
+				"policy", policyName,
+				"generation", generationKey)
+
+			// Decrement counter for this policy and generation
+			if err := decrementStaleUnavailableCount(ctx, apiClient, policyName, generationKey); err != nil {
+				setupLog.Error(err, "Failed to decrement stale count", "policy", policyName)
+				// no return to continue with other enactments
+			}
+
+			// Reset retry count for this enactment and generation
+			if err := resetStaleRetryCount(ctx, apiClient, enactment.Name, generationKey); err != nil {
+				setupLog.Error(err, "Failed to reset stale retry count", "enactment", enactment.Name)
+				// no return to continue with other enactments
+			}
+		}
+	}
+
+	setupLog.Info("Finished cleaning up stale unavailable counts", "node", nodeName)
+	return nil
+}
+
+// decrementStaleUnavailableCount decrements the UnavailableNodeCountMap of a specific
+// policy and generation for startup cleanup.
+func decrementStaleUnavailableCount(ctx context.Context, cli client.Client, policyName, generationKey string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		policy := &nmstatev1.NodeNetworkConfigurationPolicy{}
+		if err := cli.Get(ctx, types.NamespacedName{Name: policyName}, policy); err != nil {
+			return err
+		}
+
+		if policy.Status.UnavailableNodeCountMap == nil {
+			return nil // Nothing to clean up
+		}
+
+		if policy.Status.UnavailableNodeCountMap[generationKey] > 0 {
+			policy.Status.UnavailableNodeCountMap[generationKey]--
+			setupLog.Info("Decremented stale unavailable count",
+				"policy", policyName,
+				"generation", generationKey,
+				"newCount", policy.Status.UnavailableNodeCountMap[generationKey])
+			return cli.Status().Update(ctx, policy)
+		}
+
+		return nil
+	})
+}
+
+// resetStaleRetryCount resets the RetryCount for a specific enactment and generation
+// during startup clean to prevent stale retry counts from previous interrupted reconciles.
+func resetStaleRetryCount(ctx context.Context, cli client.Client, enactmentName, generationKey string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		enactment := &nmstatev1beta1.NodeNetworkConfigurationEnactment{}
+		if err := cli.Get(ctx, types.NamespacedName{Name: enactmentName}, enactment); err != nil {
+			return err
+		}
+
+		if enactment.Status.RetryCount == nil || enactment.Status.RetryCount[generationKey] == 0 {
+			return nil
+		}
+
+		enactment.Status.RetryCount[generationKey] = 0
+		setupLog.Info("Reset stale retry count",
+			"enactment", enactmentName,
+			"generation", generationKey)
+		return cli.Status().Update(ctx, enactment)
+	})
 }
 
 // Handler runs as a daemonset and we want that each handler pod will cache/reconcile only resources that belong the node it runs on.
@@ -284,7 +481,11 @@ func setupHandlerControllers(mgr manager.Manager) error {
 		APIClient: apiClient,
 		Log:       ctrl.Log.WithName("controllers").WithName("NodeNetworkConfigurationPolicy"),
 		Scheme:    mgr.GetScheme(),
-		Recorder:  mgr.GetEventRecorderFor(fmt.Sprintf("%s.nmstate-handler", environment.NodeName())),
+		//nolint:staticcheck // TODO: migrate to GetEventRecorder
+		Recorder:           mgr.GetEventRecorderFor(fmt.Sprintf("%s.nmstate-handler", environment.NodeName())),
+		RetriesUntilFail:   environment.GetEnvVarAsInt("NNCP_MAX_RETRIES", defaultRetriesUntilFail),
+		MaximumTimeBackoff: environment.GetEnvVarAsDuration("NNCP_MAX_BACKOFF_SECONDS", defaultMaxBackoff),
+		InitialBackoff:     environment.GetEnvVarAsDuration("NNCP_INITIAL_BACKOFF_SECONDS", defaultInitialBackoff),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create NodeNetworkConfigurationPolicy controller", "controller", "NMState")
 		return err
@@ -331,7 +532,7 @@ func checkNmstateIsWorking() error {
 
 func retrieveCertAndCAIntervals() (certificate.Options, error) {
 	certManagerOpts := certificate.Options{
-		Namespace:   os.Getenv("POD_NAMESPACE"),
+		Namespace:   environment.GetEnvVar("POD_NAMESPACE", ""),
 		WebhookName: "nmstate",
 		WebhookType: certificate.MutatingWebhook,
 		ExtraLabels: names.IncludeRelationshipLabels(nil),
@@ -390,6 +591,37 @@ func setupMetricsManager(mgr manager.Manager) error {
 		setupLog.Error(err, "unable to create NodeNetworkConfigurationEnactment metrics controller", "metrics", "NMState")
 		return err
 	}
+
+	setupLog.Info("Creating Metrics NodeNetworkState controller")
+	if err := (&controllersmetrics.NodeNetworkStateReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("metrics").WithName("NodeNetworkState"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create NodeNetworkState metrics controller", "metrics", "NMState")
+		return err
+	}
+
+	setupLog.Info("Creating Metrics NodeNetworkConfigurationPolicy controller")
+	if err := (&controllersmetrics.NodeNetworkConfigurationPolicyReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("metrics").WithName("NodeNetworkConfigurationPolicy"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create NodeNetworkConfigurationPolicy metrics controller", "metrics", "NMState")
+		return err
+	}
+
+	setupLog.Info("Creating Metrics NodeNetworkConfigurationEnactment status controller")
+	if err := (&controllersmetrics.NodeNetworkConfigurationEnactmentStatusReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("metrics").WithName("NodeNetworkConfigurationEnactmentStatus"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create NodeNetworkConfigurationEnactment status metrics controller", "metrics", "NMState")
+		return err
+	}
+
 	return nil
 }
 
@@ -419,7 +651,7 @@ func lockHandler() (*flock.Flock, error) {
 	setupLog.Info(fmt.Sprintf("Try to take exclusive lock on file: %s", lockFilePath))
 	handlerLock := flock.New(lockFilePath)
 	interval := 5 * time.Second
-	err := wait.PollUntilContextCancel(context.TODO(), interval, true, /*immediate*/
+	err := wait.PollUntilContextCancel(context.Background(), interval, true, /*immediate*/
 		func(context.Context) (done bool, err error) {
 			locked, err := handlerLock.TryLock()
 			if err != nil {

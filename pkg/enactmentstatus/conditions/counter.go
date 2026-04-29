@@ -18,9 +18,12 @@ limitations under the License.
 package conditions
 
 import (
+	"context"
 	"fmt"
 
+	nmstatev1 "github.com/nmstate/kubernetes-nmstate/api/v1"
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	nmstate "github.com/nmstate/kubernetes-nmstate/api/shared"
 	nmstatev1beta1 "github.com/nmstate/kubernetes-nmstate/api/v1beta1"
@@ -93,10 +96,10 @@ func (c ConditionCount) NotProgressing() int {
 	return c.progressing().false()
 }
 func (c ConditionCount) Pending() int {
-	return c.progressing().true()
+	return c.pending().true()
 }
 func (c ConditionCount) NotPending() int {
-	return c.progressing().false()
+	return c.pending().false()
 }
 func (c ConditionCount) Available() int {
 	return c.available().true()
@@ -124,4 +127,39 @@ func (c ConditionCount) String() string {
 
 func (c CountByConditionStatus) String() string {
 	return fmt.Sprintf("{true: %d, false: %d, unknown: %d}", c.true(), c.false(), c.unknown())
+}
+
+type LogicalConditionCountFilter map[nmstate.ConditionType]corev1.ConditionStatus
+
+func CountConditionsLogicalAnd(
+	ctx context.Context,
+	cli client.Client,
+	policy *nmstatev1.NodeNetworkConfigurationPolicy,
+	filter LogicalConditionCountFilter) (int, error) {
+	conditionCount := 0
+	enactments := nmstatev1beta1.NodeNetworkConfigurationEnactmentList{}
+	policyLabelFilter := client.MatchingLabels{nmstate.EnactmentPolicyLabel: policy.Name}
+
+	if err := cli.List(ctx, &enactments, policyLabelFilter); err != nil {
+		return 0, fmt.Errorf("getting enactments failed: %w", err)
+	}
+
+	for enactmentIndex := range enactments.Items {
+		enactment := enactments.Items[enactmentIndex]
+		increase := true
+		for conditionType, expected := range filter {
+			condition := enactment.Status.Conditions.Find(conditionType)
+			if condition == nil {
+				return 0, fmt.Errorf("enactment condition %s not found", conditionType)
+			}
+			if condition.Status != expected {
+				increase = false
+				break
+			}
+		}
+		if increase && enactment.Status.PolicyGeneration == policy.Generation {
+			conditionCount++
+		}
+	}
+	return conditionCount, nil
 }

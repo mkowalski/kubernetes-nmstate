@@ -76,18 +76,8 @@ spec:
               value: "False"
             - name: PROFILER_PORT
               value: "6060"
-        - args:
-          - --logtostderr
-          - --secure-listen-address=:8443
-          - --upstream=http://127.0.0.1:8089
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-              - ALL
-          image: {{ .KubeRBACProxyImage }}
-          imagePullPolicy: IfNotPresent
-          name: kube-rbac-proxy
+            - name: METRICS_BIND_ADDRESS
+              value: ":8443"
           ports:
           - containerPort: 8443
             name: metrics
@@ -105,14 +95,16 @@ spec:
             timeoutSeconds: 1
             successThreshold: 1
             failureThreshold: 3
-          resources:
-            requests:
-              cpu: "10m"
-              memory: "20Mi"
-            limits:
-              cpu: "500m"
-              memory: "1Gi"
-          terminationMessagePolicy: FallbackToLogsOnError
+{{- if .IsOpenShift }}
+          volumeMounts:
+          - name: metrics-tls
+            readOnly: true
+            mountPath: /tmp/k8s-metrics-server/serving-certs
+      volumes:
+        - name: metrics-tls
+          secret:
+            secretName: {{template "handlerPrefix" .}}openshift-nmstate-metrics
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -350,7 +342,7 @@ spec:
           {"effect": "PreferredDuringScheduling"}
     spec:
       # Needed to force vlan filtering config with iproute commands until
-      # future nmstate/NM is in place.
+      # latest nmstate/NM is in place.
       # https://github.com/nmstate/nmstate/pull/440
       hostNetwork: true
       # Use Default to get node's DNS configuration [1]
@@ -421,6 +413,12 @@ spec:
               value: "{{ .ProbeConfiguration.DNS.Host }}"
             - name: METRICS_BIND_ADDRESS
               value: "{{ .MetricsConfiguration.BindAddress }}"
+            - name: NNCP_MAX_RETRIES
+              value: "{{ .NNCPMaxRetries }}"
+            - name: NNCP_MAX_BACKOFF_SECONDS
+              value: "{{ .NNCPMaxBackoffSeconds }}"
+            - name: NNCP_INITIAL_BACKOFF_SECONDS
+              value: "{{ .NNCPInitialBackoffSeconds }}"
           volumeMounts:
             - name: dbus-socket
               mountPath: /run/dbus/system_bus_socket
@@ -428,6 +426,8 @@ spec:
               mountPath: /var/k8s_nmstate
             - name: ovs-socket
               mountPath: /run/openvswitch
+            - name: systemd-network
+              mountPath: /etc/systemd/network
           securityContext:
             privileged: true
           readinessProbe:
@@ -443,7 +443,7 @@ spec:
               command:
               - bash
               - -c
-              - "nmstatectl show {{ .HandlerReadinessProbeExtraArg }} 2>&1"
+              - "nmstatectl show lo {{ .HandlerReadinessProbeExtraArg }} 2>&1"
             initialDelaySeconds: 60
             periodSeconds: 60
             timeoutSeconds: 10
@@ -460,6 +460,10 @@ spec:
         - name: ovs-socket
           hostPath:
             path: /run/openvswitch
+        - name: systemd-network
+          hostPath:
+            path: /etc/systemd/network
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
@@ -483,6 +487,10 @@ kind: Service
 metadata:
   name: {{template "handlerPrefix" .}}nmstate-monitor
   namespace: {{ .HandlerNamespace }}
+{{- if .IsOpenShift }}
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: {{template "handlerPrefix" .}}openshift-nmstate-metrics
+{{- end }}
   labels:
     prometheus.nmstate.io: "true"
 spec:
@@ -508,6 +516,7 @@ webhooks:
   - name: nodenetworkconfigurationpolicies-mutate.nmstate.io
     admissionReviewVersions: ["v1", "v1beta1"]
     sideEffects: None
+    failurePolicy: Ignore
     clientConfig:
       service:
         name: {{template "handlerPrefix" .}}nmstate-webhook
@@ -521,6 +530,7 @@ webhooks:
   - name: nodenetworkconfigurationpolicies-status-mutate.nmstate.io
     admissionReviewVersions: ["v1", "v1beta1"]
     sideEffects: None
+    failurePolicy: Ignore
     clientConfig:
       service:
         name: {{template "handlerPrefix" .}}nmstate-webhook
@@ -534,6 +544,7 @@ webhooks:
   - name: nodenetworkconfigurationpolicies-timestamp-mutate.nmstate.io
     admissionReviewVersions: ["v1", "v1beta1"]
     sideEffects: None
+    failurePolicy: Ignore
     clientConfig:
       service:
         name: {{template "handlerPrefix" .}}nmstate-webhook
@@ -544,32 +555,63 @@ webhooks:
         apiGroups: ["*"]
         apiVersions: ["v1alpha1","v1beta1","v1"]
         resources: ["nodenetworkconfigurationpolicies", "nodenetworkconfigurationpolicies/status"]
-  - name: nodenetworkconfigurationpolicies-update-validate.nmstate.io
-    admissionReviewVersions: ["v1", "v1beta1"]
-    sideEffects: None
-    clientConfig:
-      service:
-        name: {{template "handlerPrefix" .}}nmstate-webhook
-        namespace: {{ .HandlerNamespace }}
-        path: "/nodenetworkconfigurationpolicies-update-validate"
-    rules:
-      - operations: ["UPDATE"]
-        apiGroups: ["*"]
-        apiVersions: ["v1alpha1","v1beta1","v1"]
-        resources: ["nodenetworkconfigurationpolicies"]
-  - name: nodenetworkconfigurationpolicies-create-validate.nmstate.io
-    admissionReviewVersions: [ "v1", "v1beta1" ]
-    sideEffects: None
-    clientConfig:
-      service:
-        name: {{template "handlerPrefix" .}}nmstate-webhook
-        namespace: {{ .HandlerNamespace }}
-        path: "/nodenetworkconfigurationpolicies-create-validate"
-    rules:
-      - operations: ["CREATE"]
-        apiGroups: ["*"]
-        apiVersions: ["v1alpha1","v1beta1","v1"]
-        resources: ["nodenetworkconfigurationpolicies"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{template "handlerPrefix" .}}nncp-validation-policy
+  labels:
+    app: kubernetes-nmstate
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["nmstate.io"]
+      apiVersions: ["v1", "v1beta1"]
+      resources: ["nodenetworkconfigurationpolicies"]
+      operations: ["CREATE", "UPDATE"]
+  validations:
+  - expression: >-
+      request.operation != 'CREATE' ||
+      (size(object.metadata.name) <= 63 &&
+       (object.metadata.name == '' ||
+        object.metadata.name.matches('^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$')))
+    messageExpression: "'invalid policy name: \"' + object.metadata.name + '\": must be no more than 63 characters or match label value format'"
+    reason: Invalid
+  - expression: >-
+      request.operation != 'UPDATE' ||
+      object.spec == oldObject.spec ||
+      (has(oldObject.status) && has(oldObject.status.conditions) &&
+       oldObject.status.conditions.exists(c,
+         c.type == 'Available' && has(c.reason) && c.reason != '' &&
+         c.reason != 'ConfigurationProgressing'))
+    messageExpression: "'policy ' + object.metadata.name + ' is still in progress'"
+    reason: Forbidden
+  - expression: >-
+      request.operation != 'UPDATE' ||
+      object.spec == oldObject.spec ||
+      ((!has(object.spec.capture) && !has(oldObject.spec.capture)) ||
+       (has(object.spec.capture) && has(oldObject.spec.capture) &&
+        object.spec.capture == oldObject.spec.capture))
+    message: "invalid policy operation: capture field cannot be modified"
+    reason: Invalid
+  - expression: >-
+      !has(object.spec.nodeSelector) ||
+      object.spec.nodeSelector.all(k,
+        !format.labelValue().validate(object.spec.nodeSelector[k]).hasValue())
+    message: "nodeSelector values must be valid label values"
+    reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{template "handlerPrefix" .}}nncp-validation-policy-binding
+  labels:
+    app: kubernetes-nmstate
+spec:
+  policyName: {{template "handlerPrefix" .}}nncp-validation-policy
+  validationActions:
+  - Deny
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -596,7 +638,12 @@ spec:
     port: metrics
     bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     tlsConfig:
+{{- if .IsOpenShift }}
+      caFile: /etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt
+      serverName: {{template "handlerPrefix" .}}nmstate-monitor.{{ .HandlerNamespace }}.svc
+{{- else }}
       insecureSkipVerify: true
+{{- end }}
     metricRelabelings:
       - action: labeldrop
         regex: instance
@@ -646,3 +693,24 @@ subjects:
   - kind: ServiceAccount
     name: prometheus-k8s
     namespace: {{ .MonitoringNamespace }}
+{{- if .IsOpenShift }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    openshift.io/cluster-monitoring: ""
+    prometheus.nmstate.io: "true"
+  name: kubernetes-nmstate-prometheus-rules
+  namespace: {{ .HandlerNamespace }}
+spec:
+  groups:
+    - name: kubernetes-nmstate.rules
+      rules:
+        - expr: sum(kubernetes_nmstate_features_applied) by (name)
+          record: cluster:kubernetes_nmstate_features_applied:sum
+        - expr: sum(kubernetes_nmstate_network_interfaces) by (type)
+          record: cluster:kubernetes_nmstate_network_interfaces:sum
+        - expr: sum(kubernetes_nmstate_routes) by (ip_stack, type)
+          record: cluster:kubernetes_nmstate_routes:sum
+{{- end }}

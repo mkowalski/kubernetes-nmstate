@@ -36,11 +36,6 @@ spec:
               matchExpressions:
               - key: node-role.kubernetes.io/control-plane
                 operator: Exists
-          - weight: 1
-            preference:
-              matchExpressions:
-              - key: node-role.kubernetes.io/master
-                operator: Exists
       priorityClassName: system-cluster-critical
       securityContext:
         runAsNonRoot: true
@@ -88,6 +83,7 @@ spec:
             limits:
               cpu: "500m"
               memory: "1Gi"
+          terminationMessagePolicy: FallbackToLogsOnError
           env:
             - name: WATCH_NAMESPACE
               value: ""

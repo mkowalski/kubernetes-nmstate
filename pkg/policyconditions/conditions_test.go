@@ -213,7 +213,7 @@ var _ = Describe("Policy Conditions", func() {
 
 			client := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(updatedPolicy).WithRuntimeObjects(objs...).Build()
 			key := types.NamespacedName{Name: updatedPolicy.Name}
-			err := Update(client, client, key)
+			err := Update(context.TODO(), client, client, key)
 			Expect(err).ToNot(HaveOccurred())
 			err = client.Get(context.TODO(), key, updatedPolicy)
 			Expect(err).ToNot(HaveOccurred())
@@ -350,6 +350,43 @@ var _ = Describe("Policy Conditions", func() {
 			},
 			Pods:   newNmstatePods(4),
 			Policy: p(SetPolicySuccess, "3/4 nodes successfully configured, 1 nodes ignored due to NotReady state"),
+		}),
+		Entry("when some enactments are pending and not all ready nodes finished, policy is progressing", ConditionsCase{
+			Enactments: []nmstatev1beta1.NodeNetworkConfigurationEnactment{
+				e("node1", "policy1", enactmentconditions.SetSuccess),
+				e("node2", "policy1", enactmentconditions.SetSuccess),
+				e("node3", "policy1", enactmentconditions.SetPending),
+			},
+			Nodes:  newNodes(3),
+			Pods:   newNmstatePods(3),
+			Policy: p(SetPolicyProgressing, "Policy is progressing 2/3 nodes finished"),
+		}),
+		Entry("when all ready nodes finished but some are pending, policy is progressing not available", ConditionsCase{
+			Enactments: []nmstatev1beta1.NodeNetworkConfigurationEnactment{
+				e("node1", "policy1", enactmentconditions.SetSuccess),
+				e("node2", "policy1", enactmentconditions.SetSuccess),
+				e("node3", "policy1", enactmentconditions.SetSuccess),
+				e("node4", "policy1", enactmentconditions.SetPending),
+			},
+			Nodes: []corev1.Node{
+				newNode(1),
+				newNode(2),
+				newNode(3),
+				newNotReadyNode(4),
+			},
+			Pods:   newNmstatePods(4),
+			Policy: p(SetPolicyProgressing, "Policy is progressing 3/3 nodes finished, 1 pending, 1 nodes ignored due to NotReady state"),
+		}),
+		Entry("when all ready nodes finished but some are pending due to MaxUnavailable, policy is progressing", ConditionsCase{
+			Enactments: []nmstatev1beta1.NodeNetworkConfigurationEnactment{
+				e("node1", "policy1", enactmentconditions.SetSuccess),
+				e("node2", "policy1", enactmentconditions.SetSuccess),
+				e("node3", "policy1", enactmentconditions.SetSuccess),
+				e("node4", "policy1", enactmentconditions.SetPending),
+			},
+			Nodes:  newNodes(4),
+			Pods:   newNmstatePods(4),
+			Policy: p(SetPolicyProgressing, "Policy is progressing 3/4 nodes finished"),
 		}),
 	)
 })
