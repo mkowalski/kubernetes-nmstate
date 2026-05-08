@@ -29,6 +29,8 @@ rules:
   - admissionregistration.k8s.io
   resources:
   - mutatingwebhookconfigurations
+  - validatingadmissionpolicies
+  - validatingadmissionpolicybindings
   verbs:
   - '*'
 - apiGroups:
@@ -56,6 +58,7 @@ rules:
 - apiGroups:
   - monitoring.coreos.com
   resources:
+  - prometheusrules
   - servicemonitors
   verbs:
   - create

@@ -22,8 +22,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -36,28 +37,33 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"github.com/openshift/cluster-network-operator/pkg/render"
-
-	openshiftoperatorv1 "github.com/openshift/api/operator/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/nmstate/kubernetes-nmstate/api/names"
 	"github.com/nmstate/kubernetes-nmstate/api/shared"
 	nmstatev1 "github.com/nmstate/kubernetes-nmstate/api/v1"
-	"github.com/nmstate/kubernetes-nmstate/pkg/cluster"
 	"github.com/nmstate/kubernetes-nmstate/pkg/environment"
-	nmstaterenderer "github.com/nmstate/kubernetes-nmstate/pkg/render"
+	"github.com/nmstate/kubernetes-nmstate/pkg/render"
+)
+
+const (
+	nmstateOperatorFieldOwner = client.FieldOwner("nmstate-operator")
 )
 
 // NMStateReconciler reconciles a NMState object
 type NMStateReconciler struct {
 	client.Client
-	APIClient client.Client
-	Log       logr.Logger
-	Scheme    *runtime.Scheme
+	APIClient   client.Client
+	Log         logr.Logger
+	Scheme      *runtime.Scheme
+	IsOpenShift bool
+	deployments []client.ObjectKey
+	daemonSets  []client.ObjectKey
 }
 
 // +kubebuilder:rbac:groups="",resources=services;endpoints;persistentvolumeclaims;events;configmaps;secrets;pods,verbs="*"
@@ -65,6 +71,7 @@ type NMStateReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments;daemonsets;replicasets;statefulsets,verbs="*",namespace="{{ .OperatorNamespace }}"
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs="*",namespace="{{ .OperatorNamespace }}"
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations,verbs="*"
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs="*"
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;rolebindings;roles,verbs="*"
 // +kubebuilder:rbac:groups=nmstate.io,resources="*",verbs="*"
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources="*",verbs="*"
@@ -73,21 +80,14 @@ type NMStateReconciler struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=list;get
 // +kubebuilder:rbac:groups="console.openshift.io",resources=consoleplugins,verbs="*"
 // +kubebuilder:rbac:groups="operator.openshift.io",resources=consoles,verbs=list;get;watch;update
-// +kubebuilder:rbac:groups="monitoring.coreos.com",resources=servicemonitors,verbs=list;get;watch;update;create;patch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs="*"
+// +kubebuilder:rbac:groups="monitoring.coreos.com",resources=servicemonitors;prometheusrules,verbs=list;get;watch;update;create;patch
+// +kubebuilder:rbac:groups="networking.k8s.io",resources=networkpolicies,verbs="*"
 
 func (r *NMStateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = context.Background()
 	_ = r.Log.WithValues("nmstate", req.NamespacedName)
-
-	// Fetch the NMState instance
-	instanceList := &nmstatev1.NMStateList{}
-	err := r.Client.List(context.TODO(), instanceList, &client.ListOptions{})
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed listing all NMState instances")
-	}
+	r.Log.Info("Starting Reconcile")
 	instance := &nmstatev1.NMState{}
-	err = r.Client.Get(context.TODO(), req.NamespacedName, instance)
+	err := r.Get(ctx, req.NamespacedName, instance)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile req.
@@ -96,6 +96,14 @@ func (r *NMStateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, nil
 		}
 		// Error reading the object - requeue the req.
+		return ctrl.Result{}, err
+	}
+
+	// Fetch the NMState instance
+	instanceList := &nmstatev1.NMStateList{}
+	if err := r.List(ctx, instanceList, &client.ListOptions{}); err != nil {
+		err = errors.Wrap(err, "failed listing all NMState instances")
+		r.setDegradedCondition(ctx, instance, shared.NmstateInternalError, err.Error())
 		return ctrl.Result{}, err
 	}
 
@@ -108,7 +116,7 @@ func (r *NMStateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		if instanceList.Items[0].Name != req.Name {
 			r.Log.Info("Ignoring NMState.nmstate.io because one already exists and does not match existing name")
-			err = r.Client.Delete(context.TODO(), instance, &client.DeleteOptions{})
+			err = r.Delete(ctx, instance, &client.DeleteOptions{})
 			if err != nil {
 				r.Log.Error(err, "failed to remove NMState.nmstate.io instance")
 			}
@@ -116,12 +124,20 @@ func (r *NMStateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	r.deployments = []client.ObjectKey{}
+	r.daemonSets = []client.ObjectKey{}
+
 	if err := r.applyManifests(instance, ctx); err != nil {
+		r.setDegradedCondition(ctx, instance, shared.NmstateInternalError, err.Error())
 		return ctrl.Result{}, err
 	}
 
 	if err := r.cleanupObsoleteResources(ctx); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileStatus(ctx, instance); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed reconciling status: %w", err)
 	}
 
 	r.Log.Info("Reconcile complete.")
@@ -131,98 +147,89 @@ func (r *NMStateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 func (r *NMStateReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&nmstatev1.NMState{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.DaemonSet{}).
 		Complete(r)
 }
 
 func (r *NMStateReconciler) applyManifests(instance *nmstatev1.NMState, ctx context.Context) error {
-	if err := r.applyCRDs(instance); err != nil {
+	if err := r.applyCRDs(ctx, instance); err != nil {
 		return errors.Wrap(err, "failed applying CRDs")
 	}
 
-	if err := r.applyNamespace(instance); err != nil {
+	if err := r.applyNamespace(ctx, instance); err != nil {
 		return errors.Wrap(err, "failed applying Namespace")
 	}
 
-	if err := r.applyRBAC(instance); err != nil {
+	if err := r.applyRBAC(ctx, instance); err != nil {
 		return errors.Wrap(err, "failed applying RBAC")
 	}
 
-	if err := r.applyNetworkPolicies(instance); err != nil {
+	if err := r.applyNetworkPolicies(ctx, instance); err != nil {
 		return errors.Wrap(err, "failed applying network policies")
 	}
 
-	if err := r.applyHandler(instance); err != nil {
+	if err := r.applyHandler(ctx, instance); err != nil {
 		return errors.Wrap(err, "failed applying Handler")
 	}
 
-	isOpenShift, err := cluster.IsOpenShift(r.APIClient)
-
 	_, errUIPluginPathExists := os.Stat(filepath.Join(names.ManifestDir, "kubernetes-nmstate", "openshift", "ui-plugin"))
-	if err == nil && isOpenShift && errUIPluginPathExists == nil {
-		if err = r.applyOpenshiftUIPlugin(instance); err != nil {
+	if r.IsOpenShift && errUIPluginPathExists == nil {
+		if err := r.applyOpenshiftUIPlugin(ctx, instance); err != nil {
 			return errors.Wrap(err, "failed applying UI Plugin")
 		}
-		if err = r.patchOpenshiftConsolePlugin(ctx); err != nil {
+		if err := r.patchOpenshiftConsolePlugin(ctx); err != nil {
 			return errors.Wrap(err, "failed enabling the plugin in cluster's console")
 		}
-	} else if err != nil {
-		r.Log.Info("Warning: could not determine if running on OpenShift")
 	}
 	return nil
 }
 
-func (r *NMStateReconciler) applyCRDs(instance *nmstatev1.NMState) error {
+func (r *NMStateReconciler) applyCRDs(ctx context.Context, instance *nmstatev1.NMState) error {
 	data := render.MakeRenderData()
-	return r.renderAndApply(instance, data, "crds", false)
+	return r.renderAndApply(ctx, instance, data, "crds", false)
 }
 
-func (r *NMStateReconciler) applyNamespace(instance *nmstatev1.NMState) error {
+func (r *NMStateReconciler) applyNamespace(ctx context.Context, instance *nmstatev1.NMState) error {
 	data := render.MakeRenderData()
-	data.Data["HandlerNamespace"] = os.Getenv("HANDLER_NAMESPACE")
-	data.Data["HandlerPrefix"] = os.Getenv("HANDLER_PREFIX")
-	return r.renderAndApply(instance, data, "namespace", false)
+	data.Data["HandlerNamespace"] = environment.GetEnvVar("HANDLER_NAMESPACE", "")
+	data.Data["HandlerPrefix"] = environment.GetEnvVar("HANDLER_PREFIX", "")
+	data.Data["IsOpenShift"] = r.IsOpenShift
+
+	return r.renderAndApply(ctx, instance, data, "namespace", false)
 }
 
-func (r *NMStateReconciler) applyNetworkPolicies(instance *nmstatev1.NMState) error {
+func (r *NMStateReconciler) applyNetworkPolicies(ctx context.Context, instance *nmstatev1.NMState) error {
 	data := render.MakeRenderData()
-	data.Data["HandlerNamespace"] = os.Getenv("HANDLER_NAMESPACE")
-	data.Data["OperatorNamespace"] = os.Getenv("OPERATOR_NAMESPACE")
-	data.Data["PluginNamespace"] = os.Getenv("HANDLER_NAMESPACE")
+	data.Data["HandlerNamespace"] = environment.GetEnvVar("HANDLER_NAMESPACE", "")
+	data.Data["OperatorNamespace"] = environment.GetEnvVar("OPERATOR_NAMESPACE", "")
+	data.Data["PluginNamespace"] = environment.GetEnvVar("HANDLER_NAMESPACE", "")
+	data.Data["IsOpenShift"] = r.IsOpenShift
 
-	isOpenShift, err := cluster.IsOpenShift(r.APIClient)
-	if err != nil {
-		return err
-	}
-	data.Data["IsOpenShift"] = isOpenShift
-
-	return r.renderAndApply(instance, data, "netpol", true)
+	return r.renderAndApply(ctx, instance, data, "netpol", true)
 }
 
-func (r *NMStateReconciler) applyRBAC(instance *nmstatev1.NMState) error {
+func (r *NMStateReconciler) applyRBAC(ctx context.Context, instance *nmstatev1.NMState) error {
 	data := render.MakeRenderData()
 	data.Data["HandlerNamespace"] = os.Getenv("HANDLER_NAMESPACE")
 	data.Data["HandlerImage"] = os.Getenv("HANDLER_IMAGE")
 	data.Data["HandlerPullPolicy"] = os.Getenv("HANDLER_IMAGE_PULL_POLICY")
 	data.Data["HandlerPrefix"] = os.Getenv("HANDLER_PREFIX")
 
-	if err := setClusterReaderExist(r.Client, data); err != nil {
+	if err := setClusterReaderExist(ctx, r.Client, data); err != nil {
 		return errors.Wrap(err, "failed checking if cluster-reader ClusterRole exists")
 	}
 
-	isOpenShift, err := cluster.IsOpenShift(r.APIClient)
-	if err != nil {
-		return err
-	}
-	data.Data["IsOpenShift"] = isOpenShift
+	data.Data["IsOpenShift"] = r.IsOpenShift
 
-	return r.renderAndApply(instance, data, "rbac", true)
+	return r.renderAndApply(ctx, instance, data, "rbac", true)
 }
 
 // nolint: funlen
-func (r *NMStateReconciler) applyHandler(instance *nmstatev1.NMState) error {
+func (r *NMStateReconciler) applyHandler(ctx context.Context, instance *nmstatev1.NMState) error {
 	data := render.MakeRenderData()
 	// Register ToYaml template method
-	data.Funcs["toYaml"] = nmstaterenderer.ToYaml
+	data.Funcs["toYaml"] = render.ToYaml
 	// Prepare defaults
 	masterExistsNoScheduleTolerations := []corev1.Toleration{
 		{
@@ -240,16 +247,6 @@ func (r *NMStateReconciler) applyHandler(instance *nmstatev1.NMState) error {
 		Key:      "",
 		Operator: corev1.TolerationOpExists,
 	}
-	archNodeSelector := map[string]string{
-		"kubernetes.io/arch": goruntime.GOARCH,
-	}
-	archAndCRNodeSelector := instance.Spec.NodeSelector
-	if archAndCRNodeSelector == nil {
-		archAndCRNodeSelector = map[string]string{
-			"kubernetes.io/arch": goruntime.GOARCH,
-			"kubernetes.io/os":   "linux",
-		}
-	}
 	handlerTolerations := instance.Spec.Tolerations
 	if handlerTolerations == nil {
 		handlerTolerations = []corev1.Toleration{operatorExistsToleration}
@@ -259,11 +256,17 @@ func (r *NMStateReconciler) applyHandler(instance *nmstatev1.NMState) error {
 		handlerAffinity = &corev1.Affinity{}
 	}
 
-	archAndCRInfraNodeSelector := instance.Spec.InfraNodeSelector
-	if archAndCRInfraNodeSelector == nil {
-		archAndCRInfraNodeSelector = archNodeSelector
-	} else {
-		archAndCRInfraNodeSelector["kubernetes.io/arch"] = goruntime.GOARCH
+	nodeSelector := instance.Spec.NodeSelector
+	if nodeSelector == nil {
+		nodeSelector = map[string]string{
+			corev1.LabelOSStable: "linux",
+		}
+	}
+	infraNodeSelector := instance.Spec.InfraNodeSelector
+	if infraNodeSelector == nil {
+		infraNodeSelector = map[string]string{
+			corev1.LabelOSStable: "linux",
+		}
 	}
 
 	infraTolerations := instance.Spec.InfraTolerations
@@ -303,7 +306,7 @@ func (r *NMStateReconciler) applyHandler(instance *nmstatev1.NMState) error {
 		}
 	}
 
-	webhookReplicaCountMin, webhookReplicaCountDesired, err := r.webhookReplicaCount(archAndCRInfraNodeSelector, infraTolerations)
+	webhookReplicaCountMin, webhookReplicaCountDesired, err := r.webhookReplicaCount(ctx, infraNodeSelector, infraTolerations)
 	if err != nil {
 		return fmt.Errorf("could not get min replica count for webhook: %w", err)
 	}
@@ -340,12 +343,12 @@ func (r *NMStateReconciler) applyHandler(instance *nmstatev1.NMState) error {
 	data.Data["HandlerPrefix"] = os.Getenv("HANDLER_PREFIX")
 	data.Data["MonitoringNamespace"] = os.Getenv("MONITORING_NAMESPACE")
 	data.Data["KubeRBACProxyImage"] = os.Getenv("KUBE_RBAC_PROXY_IMAGE")
-	data.Data["InfraNodeSelector"] = archAndCRInfraNodeSelector
+	data.Data["InfraNodeSelector"] = infraNodeSelector
 	data.Data["InfraTolerations"] = infraTolerations
 	data.Data["WebhookAffinity"] = infraAffinity
 	data.Data["WebhookReplicas"] = webhookReplicaCountDesired
 	data.Data["WebhookMinReplicas"] = webhookReplicaCountMin
-	data.Data["HandlerNodeSelector"] = archAndCRNodeSelector
+	data.Data["HandlerNodeSelector"] = nodeSelector
 	data.Data["HandlerTolerations"] = handlerTolerations
 	data.Data["HandlerAffinity"] = handlerAffinity
 	data.Data["SelfSignConfiguration"] = selfSignConfiguration
@@ -353,19 +356,17 @@ func (r *NMStateReconciler) applyHandler(instance *nmstatev1.NMState) error {
 	data.Data["MetricsConfiguration"] = metricsConfig
 	data.Data["LogLevelHandlerCommandArg"] = logLevelHandlerCommandArg
 	data.Data["HandlerReadinessProbeExtraArg"] = handlerReadinessProbeExtraArg
+	data.Data["IsOpenShift"] = r.IsOpenShift
+	data.Data["NNCPMaxRetries"] = environment.GetEnvVar("NNCP_MAX_RETRIES", "5")
+	data.Data["NNCPMaxBackoffSeconds"] = environment.GetEnvVar("NNCP_MAX_BACKOFF_SECONDS", "30")
+	data.Data["NNCPInitialBackoffSeconds"] = environment.GetEnvVar("NNCP_INITIAL_BACKOFF_SECONDS", "1")
 
-	isOpenShift, err := cluster.IsOpenShift(r.APIClient)
-	if err != nil {
-		return err
-	}
-	data.Data["IsOpenShift"] = isOpenShift
-
-	return r.renderAndApply(instance, data, "handler", true)
+	return r.renderAndApply(ctx, instance, data, "handler", true)
 }
 
-func (r *NMStateReconciler) applyOpenshiftUIPlugin(instance *nmstatev1.NMState) error {
+func (r *NMStateReconciler) applyOpenshiftUIPlugin(ctx context.Context, instance *nmstatev1.NMState) error {
 	data := render.MakeRenderData()
-	data.Funcs["toYaml"] = nmstaterenderer.ToYaml
+	data.Funcs["toYaml"] = render.ToYaml
 	data.Data["PluginNamespace"] = environment.GetEnvVar("HANDLER_NAMESPACE", "openshift-nmstate")
 	data.Data["PluginName"] = environment.GetEnvVar("PLUGIN_NAME", "nmstate-console-plugin")
 	data.Data["PluginImage"] = environment.GetEnvVar("PLUGIN_IMAGE", "quay.io/nmstate/nmstate-console-plugin:release-1.0.0")
@@ -376,26 +377,36 @@ func (r *NMStateReconciler) applyOpenshiftUIPlugin(instance *nmstatev1.NMState) 
 	data.Data["InfraTolerations"] = instance.Spec.InfraTolerations
 	data.Data["InfraAffinity"] = instance.Spec.InfraAffinity
 
-	return r.renderAndApply(instance, data, filepath.Join("openshift", "ui-plugin"), true)
+	return r.renderAndApply(ctx, instance, data, filepath.Join("openshift", "ui-plugin"), true)
 }
 
 func (r *NMStateReconciler) patchOpenshiftConsolePlugin(ctx context.Context) error {
 	// Enable console plugin for nmstate-console if not already enabled
 	pluginName := environment.GetEnvVar("PLUGIN_NAME", "nmstate-console-plugin")
+
+	consoleObj := &unstructured.Unstructured{}
+	consoleObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "operator.openshift.io",
+		Version: "v1",
+		Kind:    "Console",
+	})
+
 	consoleKey := client.ObjectKey{Name: "cluster"}
-	consoleObj := &openshiftoperatorv1.Console{}
-	if err := r.Client.Get(ctx, consoleKey, consoleObj); err != nil {
+	if err := r.Get(ctx, consoleKey, consoleObj); err != nil {
 		r.Log.Error(err, "Could not get consoles.operator.openshift.io resource")
 		return err
 	}
 
-	if !stringInSlice(pluginName, consoleObj.Spec.Plugins) {
+	plugins, _, _ := unstructured.NestedStringSlice(consoleObj.Object, "spec", "plugins")
+	if !stringInSlice(pluginName, plugins) {
 		r.Log.Info("Enabling kubevirt plugin in Console")
-		consoleObj.Spec.Plugins = append(consoleObj.Spec.Plugins, pluginName)
-		err := r.Client.Update(ctx, consoleObj)
-		if err != nil {
+		plugins = append(plugins, pluginName)
+		if err := unstructured.SetNestedStringSlice(consoleObj.Object, plugins, "spec", "plugins"); err != nil {
+			return fmt.Errorf("could not set spec.plugins: %w", err)
+		}
+		if err := r.Update(ctx, consoleObj); err != nil {
 			r.Log.Error(err, fmt.Sprintf("Could not update resource - APIVersion: %s, Kind: %s, Name: %s",
-				consoleObj.APIVersion, consoleObj.Kind, consoleObj.Name))
+				consoleObj.GetAPIVersion(), consoleObj.GetKind(), consoleObj.GetName()))
 			return err
 		}
 	}
@@ -403,16 +414,12 @@ func (r *NMStateReconciler) patchOpenshiftConsolePlugin(ctx context.Context) err
 }
 
 func (r *NMStateReconciler) cleanupObsoleteResources(ctx context.Context) error {
-	isOpenShift, err := cluster.IsOpenShift(r.APIClient)
-	if err != nil {
-		return err
-	}
 	// We are no longer using cert-manager at openshift, let's remove it
-	if isOpenShift {
-		err = r.Client.Delete(ctx, &appsv1.Deployment{
+	if r.IsOpenShift {
+		err := r.Delete(ctx, &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: os.Getenv("HANDLER_NAMESPACE"),
-				Name:      os.Getenv("HANDLER_PREFIX") + "nmstate-cert-manager",
+				Namespace: environment.GetEnvVar("HANDLER_NAMESPACE", ""),
+				Name:      environment.GetEnvVar("HANDLER_PREFIX", "") + "nmstate-cert-manager",
 			},
 		})
 		if err != nil && !apierrors.IsNotFound(err) {
@@ -420,10 +427,10 @@ func (r *NMStateReconciler) cleanupObsoleteResources(ctx context.Context) error 
 		}
 
 		// Remove the non openshift secret
-		err = r.Client.Delete(ctx, &corev1.Secret{
+		err = r.Delete(ctx, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: os.Getenv("HANDLER_NAMESPACE"),
-				Name:      os.Getenv("HANDLER_PREFIX") + "nmstate-webhook",
+				Namespace: environment.GetEnvVar("HANDLER_NAMESPACE", ""),
+				Name:      environment.GetEnvVar("HANDLER_PREFIX", "") + "nmstate-webhook",
 			},
 		})
 		if err != nil && !apierrors.IsNotFound(err) {
@@ -441,7 +448,11 @@ func (r *NMStateReconciler) cleanupObsoleteResources(ctx context.Context) error 
 // 3. error
 //
 //nolint:gocritic
-func (r *NMStateReconciler) webhookReplicaCount(nodeSelector map[string]string, tolerations []corev1.Toleration) (int, int, error) {
+func (r *NMStateReconciler) webhookReplicaCount(
+	ctx context.Context,
+	nodeSelector map[string]string,
+	tolerations []corev1.Toleration,
+) (int, int, error) {
 	const (
 		multiNodeClusterReplicaCountDesired = 2
 		multiNodeClusterReplicaMinCount     = 1
@@ -451,7 +462,7 @@ func (r *NMStateReconciler) webhookReplicaCount(nodeSelector map[string]string, 
 	)
 
 	nodes := corev1.NodeList{}
-	err := r.APIClient.List(context.TODO(), &nodes, client.MatchingLabels(nodeSelector))
+	err := r.APIClient.List(ctx, &nodes, client.MatchingLabels(nodeSelector))
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get nodes: %w", err)
 	}
@@ -476,7 +487,130 @@ func (r *NMStateReconciler) webhookReplicaCount(nodeSelector map[string]string, 
 	}
 }
 
+func (r *NMStateReconciler) reconcileStatus(ctx context.Context, instance *nmstatev1.NMState) error {
+	progressing := []string{}
+	for _, deploymentKey := range r.deployments {
+		deployment := &appsv1.Deployment{}
+		if err := r.Get(ctx, deploymentKey, deployment); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return errors.Wrap(err, "failed to get deployment")
+		}
+		if deployment.Status.UnavailableReplicas > 0 {
+			progressing = append(progressing, fmt.Sprintf(
+				"Deployment %q is not available (awaiting %d nodes)",
+				deployment.Name, deployment.Status.UnavailableReplicas))
+		} else if deployment.Status.AvailableReplicas == 0 && (deployment.Spec.Replicas == nil || *deployment.Spec.Replicas > 0) {
+			progressing = append(progressing, fmt.Sprintf(
+				"Deployment %q is not yet scheduled on any nodes", deployment.Name))
+		} else if deployment.Status.ObservedGeneration < deployment.Generation {
+			progressing = append(progressing, fmt.Sprintf(
+				"Deployment %q update is being processed (generation %d, observed generation %d)",
+				deployment.Name, deployment.Generation, deployment.Status.ObservedGeneration))
+		}
+	}
+	for _, daemonSetKey := range r.daemonSets {
+		daemonSet := &appsv1.DaemonSet{}
+		if err := r.Get(ctx, daemonSetKey, daemonSet); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return errors.Wrap(err, "failed to get daemonset")
+		}
+		if daemonSet.Status.NumberUnavailable > 0 {
+			progressing = append(progressing, fmt.Sprintf(
+				"DaemonSet %q is not available (awaiting %d nodes)",
+				daemonSet.Name, daemonSet.Status.NumberUnavailable))
+		} else if daemonSet.Status.NumberAvailable == 0 && daemonSet.Status.DesiredNumberScheduled != 0 {
+			progressing = append(progressing, fmt.Sprintf("DaemonSet %q is not yet scheduled on any nodes", daemonSet.Name))
+		} else if daemonSet.Status.UpdatedNumberScheduled < daemonSet.Status.DesiredNumberScheduled {
+			progressing = append(progressing, fmt.Sprintf("DaemonSet %q update is rolling out (%d out of %d updated)",
+				daemonSet.Name, daemonSet.Status.UpdatedNumberScheduled, daemonSet.Status.DesiredNumberScheduled))
+		} else if daemonSet.Generation > daemonSet.Status.ObservedGeneration {
+			progressing = append(progressing, fmt.Sprintf("DaemonSet %q update is being processed (generation %d, observed generation %d)",
+				daemonSet.Name, daemonSet.Generation, daemonSet.Status.ObservedGeneration))
+		}
+	}
+
+	if len(progressing) > 0 {
+		instance.Status.Conditions.Set(
+			shared.NmstateConditionProgressing,
+			corev1.ConditionTrue,
+			shared.NmstateDeploying,
+			strings.Join(progressing, "\n"),
+		)
+		instance.Status.Conditions.Set(
+			shared.NmstateConditionAvailable,
+			corev1.ConditionFalse,
+			shared.NmstateDeploying,
+			"Deploying is in progress",
+		)
+		// Clear any previous degraded condition when progressing
+		instance.Status.Conditions.Set(
+			shared.NmstateConditionDegraded,
+			corev1.ConditionFalse,
+			shared.NmstateDeploying,
+			"Deploying is in progress",
+		)
+	} else {
+		instance.Status.Conditions.Set(
+			shared.NmstateConditionProgressing,
+			corev1.ConditionFalse,
+			shared.NmstateSuccessfullyDeployed,
+			"All components are available and ready",
+		)
+		instance.Status.Conditions.Set(
+			shared.NmstateConditionAvailable,
+			corev1.ConditionTrue,
+			shared.NmstateSuccessfullyDeployed,
+			"All components are available and ready",
+		)
+		// Clear any previous degraded condition when available
+		instance.Status.Conditions.Set(
+			shared.NmstateConditionDegraded,
+			corev1.ConditionFalse,
+			shared.NmstateSuccessfullyDeployed,
+			"All components are available and ready",
+		)
+	}
+
+	// Clear managed fields before applying server-side apply to status subresource
+	instance.SetManagedFields(nil)
+
+	//nolint:staticcheck // TODO: migrate to SubResource("status").Apply()
+	return r.Client.Status().Patch(ctx, instance, client.Apply, nmstateOperatorFieldOwner)
+}
+
+func (r *NMStateReconciler) setDegradedCondition(
+	ctx context.Context,
+	instance *nmstatev1.NMState,
+	reason shared.ConditionReason,
+	message string,
+) error {
+	instance.Status.Conditions.Set(
+		shared.NmstateConditionDegraded,
+		corev1.ConditionTrue,
+		reason,
+		message,
+	)
+	instance.Status.Conditions.Set(
+		shared.NmstateConditionAvailable,
+		corev1.ConditionFalse,
+		reason,
+		message,
+	)
+	instance.Status.Conditions.Set(
+		shared.NmstateConditionProgressing,
+		corev1.ConditionFalse,
+		reason,
+		message,
+	)
+	return r.Client.Status().Update(ctx, instance)
+}
+
 func (r *NMStateReconciler) renderAndApply(
+	ctx context.Context,
 	instance *nmstatev1.NMState,
 	data render.RenderData,
 	sourceDirectory string,
@@ -507,45 +641,31 @@ func (r *NMStateReconciler) renderAndApply(
 			if err != nil {
 				return errors.Wrap(err, "failed to set owner reference")
 			}
+			if obj.GetKind() == "Deployment" {
+				r.deployments = append(r.deployments, client.ObjectKeyFromObject(obj))
+			} else if obj.GetKind() == "DaemonSet" {
+				r.daemonSets = append(r.daemonSets, client.ObjectKeyFromObject(obj))
+			}
 		}
-		if err := r.apply(context.TODO(), obj); err != nil {
-			return fmt.Errorf("failed to apply object %v: %w", obj, err)
+		// Use server-side apply
+		//nolint:staticcheck // TODO: migrate to client.Client.Apply()
+		err := r.Patch(ctx, obj, client.Apply, nmstateOperatorFieldOwner, client.ForceOwnership)
+		if err != nil {
+			// If the CRD doesn't exist (e.g., ServiceMonitor), log a warning and continue
+			if meta.IsNoMatchError(err) {
+				r.Log.Info("Skipping resource because CRD is not available", "kind", obj.GetKind(), "name", obj.GetName(), "error", err.Error())
+				continue
+			}
+			return errors.Wrap(err, "failed applying server-side apply on nmstate owned resource")
 		}
 	}
 	return nil
 }
 
-func (r *NMStateReconciler) apply(ctx context.Context, newObj *unstructured.Unstructured) error {
-	key := client.ObjectKeyFromObject(newObj)
-	oldObj := &unstructured.Unstructured{}
-	oldObj.SetGroupVersionKind(newObj.GroupVersionKind())
-	if err := r.Client.Get(ctx, key, oldObj); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		if err := r.Client.Create(ctx, newObj); err != nil {
-			return fmt.Errorf("failed creating %q \"%s:%s: %w", newObj.GetKind(), newObj.GetNamespace(), newObj.GetName(), err)
-		}
-		return nil
-	}
-	newObj.SetResourceVersion(oldObj.GetResourceVersion())
-	if err := r.Client.Patch(ctx, newObj, client.StrategicMergeFrom(oldObj)); err != nil {
-		if err := r.Client.Patch(ctx, newObj, client.MergeFrom(oldObj)); err != nil {
-			return fmt.Errorf("failed patching %q \"%s:%s: %w", newObj.GetKind(), newObj.GetNamespace(), newObj.GetName(), err)
-		}
-		r.Log.Info("failed strategic patch but succeeded fallback",
-			"kind", newObj.GetKind(),
-			"namespace", newObj.GetNamespace(),
-			"name", newObj.GetName(),
-		)
-	}
-	return nil
-}
-
-func setClusterReaderExist(c client.Client, data render.RenderData) error {
+func setClusterReaderExist(ctx context.Context, c client.Client, data render.RenderData) error {
 	var clusterReader rbac.ClusterRole
 	key := types.NamespacedName{Name: "cluster-reader"}
-	err := c.Get(context.TODO(), key, &clusterReader)
+	err := c.Get(ctx, key, &clusterReader)
 
 	found := true
 	if err != nil {
@@ -560,10 +680,5 @@ func setClusterReaderExist(c client.Client, data render.RenderData) error {
 }
 
 func stringInSlice(a string, list []string) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, a)
 }

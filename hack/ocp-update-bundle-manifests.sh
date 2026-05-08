@@ -19,6 +19,11 @@ MONITORING_NAMESPACE=${MONITORING_NAMESPACE} \
 VERSION=${VERSION} CHANNELS=${CHANNEL},alpha DEFAULT_CHANNEL=${CHANNEL} \
 BUNDLE_DIR=${BUNDLE_DIR} MANIFEST_BASES_DIR=${MANIFEST_BASES_DIR} make bundle
 
+# Use fieldRef to dynamically resolve namespace at runtime instead of hardcoding it.
+# This is required for AllNamespaces OLM install mode support.
+$(yq4) --inplace eval '(.spec.install.spec.deployments[].spec.template.spec.containers[].env[] | select(.name == "HANDLER_NAMESPACE")) |= {"name": .name, "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}}' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
+$(yq4) --inplace eval '(.spec.install.spec.deployments[].spec.template.spec.containers[].env[] | select(.name == "OPERATOR_NAMESPACE")) |= {"name": .name, "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}}' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
+
 # add the cluster permissions to use the privileged security context constraint to the nmstate-operator SA in the CSV
 $(yq4) --inplace eval '.spec.install.spec.clusterPermissions[] |= select(.rules[]) |= select(.serviceAccountName == "nmstate-operator").rules += {"apiGroups":["security.openshift.io"],"resources":["securitycontextconstraints"],"verbs":["use"],"resourceNames":["privileged"]}' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
 
@@ -37,6 +42,9 @@ $(yq4) --inplace eval '.metadata.annotations += {"features.operators.openshift.i
 $(yq4) --inplace eval '.metadata.annotations += {"features.operators.openshift.io/cnf": "false"}' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
 $(yq4) --inplace eval '.metadata.annotations += {"features.operators.openshift.io/cni": "false"}' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
 $(yq4) --inplace eval '.metadata.annotations += {"features.operators.openshift.io/csi": "false"}' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
+
+# We want olm.skipRange to use double quotes, not single.
+$(yq4) --inplace '.metadata.annotations."olm.skipRange" style="double"' ${BUNDLE_DIR}/manifests/kubernetes-nmstate-operator.clusterserviceversion.yaml
 
 # delete unneeded files
 rm -f ${BUNDLE_DIR}/manifests/nmstate.io_nodenetwork*.yaml

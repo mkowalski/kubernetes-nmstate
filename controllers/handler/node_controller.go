@@ -36,15 +36,16 @@ import (
 	"github.com/nmstate/kubernetes-nmstate/api/shared"
 	nmstatev1beta1 "github.com/nmstate/kubernetes-nmstate/api/v1beta1"
 	nmstate "github.com/nmstate/kubernetes-nmstate/pkg/client"
+	"github.com/nmstate/kubernetes-nmstate/pkg/nm"
 	"github.com/nmstate/kubernetes-nmstate/pkg/nmstatectl"
 	"github.com/nmstate/kubernetes-nmstate/pkg/node"
 	"github.com/nmstate/kubernetes-nmstate/pkg/state"
-	networkmanager "github.com/phoracek/networkmanager-go/src"
 	corev1 "k8s.io/api/core/v1"
 )
 
 // Added for test purposes
 type NmstateUpdater func(
+	ctx context.Context,
 	client client.Client,
 	node *corev1.Node,
 	observedState shared.State,
@@ -81,7 +82,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, request ctrl.Request) (c
 	}
 
 	nnsInstance := &nmstatev1beta1.NodeNetworkState{}
-	err = r.Client.Get(context.TODO(), request.NamespacedName, nnsInstance)
+	err = r.Get(ctx, request.NamespacedName, nnsInstance)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, errors.Wrap(err, "Failed to get nnstate")
@@ -98,7 +99,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, request ctrl.Request) (c
 
 	// Fetch the Node instance
 	nodeInstance := &corev1.Node{}
-	err = r.Client.Get(context.TODO(), request.NamespacedName, nodeInstance)
+	err = r.Get(ctx, request.NamespacedName, nodeInstance)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -109,7 +110,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, request ctrl.Request) (c
 		// Error reading the object - requeue the request.
 		return ctrl.Result{}, err
 	}
-	err = r.nmstateUpdater(r.Client, nodeInstance, currentState, nnsInstance, r.getDependencyVersions())
+	err = r.nmstateUpdater(ctx, r.Client, nodeInstance, currentState, nnsInstance, r.getDependencyVersions())
 	if err != nil {
 		err = errors.Wrap(err, "error at node reconcile creating NodeNetworkState")
 		return ctrl.Result{}, err
@@ -127,28 +128,14 @@ func (r *NodeReconciler) getDependencyVersions() *nmstate.DependencyVersions {
 		r.Log.Error(err, "failed retrieving handler nmstate version")
 	}
 
-	hostNmstateVersion := ""
-	nmClient, err := networkmanager.NewClientPrivate()
-
+	hostNetworkManagerVersion, err := nm.Version()
 	if err != nil {
-		r.Log.Error(err, "failed retrieving new client")
-
-		return &nmstate.DependencyVersions{
-			HandlerNmstateVersion: handlerNmstateVersion,
-			HostNmstateVersion:    hostNmstateVersion,
-		}
-	}
-
-	defer nmClient.Close()
-
-	hostNmstateVersion, err = nmClient.GetVersion()
-	if err != nil {
-		r.Log.Error(err, "error retrieving host nmstate version")
+		r.Log.Error(err, "error retrieving host Networkmanager version")
 	}
 
 	return &nmstate.DependencyVersions{
-		HandlerNmstateVersion: handlerNmstateVersion,
-		HostNmstateVersion:    hostNmstateVersion,
+		HandlerNmstateVersion:     handlerNmstateVersion,
+		HostNetworkManagerVersion: hostNetworkManagerVersion,
 	}
 }
 
